@@ -19,4 +19,37 @@ ME-TRPO is a deep model-based reinforcement learning algorithm that uses neural 
 1) The folder is saved in `data/local/ENVNAME/ENVNAME_DATETIME_0001` when running without ec2(by default).
 2) `progress.csv` contains `real_current_validation_cost` which is the negative of the reward so far.
 3) `info.log` contains the full logs of data collection, dynamics model optimization, and policy optimization. Note that we are minimizing the proxy cost, `estim_validation_cost`. The true cost is shown as `real_validation_cost`, but unseen to the policy optimizer. -->
+
 # value-difference-model
+
+### Prepare the environment
+
+```bash
+git clone https://github.com/IrisLi17/value-difference-model
+cd value-difference-model
+conda create -n <your_name> python=3.5
+conda activate <your_name>
+pip install -r requirements.txt
+```
+
+### Train the model
+
+```bash
+python run_model_based_rl.py trpo -env <env_name>
+```
+
+`<env_name>` must be one of `half-cheetah`, `swimmer`, `snake`, `ant`, `humanoid`. 
+
+`half-cheetah`, `swimmer`,  `snake` take hours to converge. `ant` takes ~3 days to converge and suffers from segment fault time to time on my machine.
+
+The logging folder is saved in `data/local/<env_name>/<env_name>_DATETIME_0001` by default.
+`progress.csv` contains `real_current_validation_cost` which is the negative of the reward so far.
+
+### Visualize
+
+*ongoing*
+
+```bash
+python run_model_based_rl.py trpo -env <env_name> -perform
+```
+
