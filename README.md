@@ -45,10 +45,30 @@ python run_model_based_rl.py trpo -env <env_name>
 The logging folder is saved in `data/local/<env_name>/<env_name>_DATETIME_0001` by default.
 `progress.csv` contains `real_current_validation_cost` which is the negative of the reward so far.
 
-### Visualize
+You can use `tensorboard` to monitor more intermediate result by:
 
-*ongoing*
+```
+tensorboard --logdir <tf_logging_dir> --port <port_number>
+```
+Also, you will need to set up ssh port forwarding to see tensorboard on your local machine.
+### Change training configuration
+To switch between original dynamic loss definition and the two proposed losses, modify `sandbox/thanard/me-trpo/params/params-<env>.json`, 
 
+`dynamics_opt_params/use_value` and `dynamics_opt_params/dvds_weighting` are the most relevant.
+
+original loss: `use_value`=False, `dvds_weighting`=False.
+
+$L^{(1)}$: `use_value`=False, `dvds_weighting`=True.
+
+$L^{(0)}$: `use_value`=True, `dvds_weighting`=False.
+
+### Visualize trained policy
+
+*Currently it cannot run on our server.*
+
+*TODO: you will need to manually modify line 612 in `model_based_rl.py` to specify the path of saved model. See my comment there.*
+
+Afterwards, run:
 ```bash
 python run_model_based_rl.py trpo -env <env_name> -perform
 ```

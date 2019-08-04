@@ -27,6 +27,7 @@ def build_dynamics_graph(scope,
                          dynamics_in_full,
                          y_training_full,
                          dvds_weight_full,
+                         dvds_raw_full,
                          value_f,
                          use_value,
                          n_dynamics_input,
@@ -49,11 +50,20 @@ def build_dynamics_graph(scope,
     :param n_states:
     :return:
     '''
+
     # For training
+    # def predict_fobs(obs_batch, coeff_ph):
+    #     obs_size = obs_batch.shape[1]
+    #     obs_sq = obs_batch ** 2
+    #     return obs_batch * coeff_ph[:, 0:obs_size] + obs_sq * coeff_ph[:, obs_size: 2 * obs_size] + coeff_ph[:, -1]
+
     def predict_fobs(obs_batch, coeff_ph):
         obs_size = obs_batch.shape[1]
         obs_sq = obs_batch ** 2
-        return obs_batch * coeff_ph[:, 0:obs_size] + obs_sq * coeff_ph[:, obs_size: 2 * obs_size] + coeff_ph[:, -1]
+        # Yunfei: Hard-code according to linear feature baselines, which is the default value function used.
+        # See line 19-23 in `rllab/baselines/linear_feature_baseline.py` for details.
+        return tf.reduce_sum(obs_batch * coeff_ph[:, 0:obs_size], axis=-1, keep_dims=True) \
+               + tf.reduce_sum(obs_sq * coeff_ph[:, obs_size: 2 * obs_size], axis=-1, keep_dims=True) + coeff_ph[:, -1]
 
     _dynamics_outs = [
         dynamics_model(
@@ -64,6 +74,7 @@ def build_dynamics_graph(scope,
         ) for i in range(n_models)
     ]
     _regularizer_losses = [get_regularizer_loss(scope, 'model%d' % i) for i in range(n_models)]
+    # Yunfei: We weight original l2 difference with \frac{\partial{V}}{\partial s}. The real data is feed at funtion `optimize_models` in this file.
     _prediction_losses = [
         tf.reduce_mean(
             tf.reduce_sum(
@@ -80,15 +91,24 @@ def build_dynamics_graph(scope,
         )
         for i, y_predicted in enumerate(_dynamics_outs)
     ]
-    # predict_outs = _dynamics_outs
-    # if use_value:
-    # intermediate result: V(f(s,a))-V(\Gamma(s,a))
+
+    # Yunfei: This correspond to L^{(0)}, which is the l2 distance between V of predicted and true state.
     _value_difference_losses = [tf.reduce_mean(tf.reduce_sum(tf.square(
         predict_fobs(y_predicted, value_f) - predict_fobs(get_ith_tensor(y_training_full, i, n_states), value_f)),
-                                                             axis=[1])) for i, y_predicted in enumerate(_dynamics_outs)]
+        axis=[1])) for i, y_predicted in enumerate(_dynamics_outs)]
     value_difference_loss = tf.reduce_sum(_value_difference_losses,
                                           name='total_value_difference_loss')
-    _state_difference_losses = [tf.reduce_mean(tf.reduce_sum(tf.square(y_predicted - get_ith_tensor(y_training_full, i, n_states)), axis=[1])) for i, y_predicted in enumerate(_dynamics_outs)]
+
+    # Yunfei: We compute the condition number only for debugging purpose.
+    _v_condition = [tf.reduce_max(tf.abs(get_ith_tensor(dvds_raw_full, i, n_states)), axis=1) / tf.abs(
+        predict_fobs(get_ith_tensor(y_training_full, i, n_states), value_f)) * tf.reduce_max(
+        tf.abs(get_ith_tensor(y_training_full, i, n_states)), axis=1) for i, y_predicted in enumerate(_dynamics_outs)]
+    v_condition = tf.reduce_max(_v_condition, name='max_value_condition')
+
+    # Yunfei: Also for debugging purpose.
+    _state_difference_losses = [
+        tf.reduce_mean(tf.reduce_sum(tf.square(y_predicted - get_ith_tensor(y_training_full, i, n_states)), axis=[1]))
+        for i, y_predicted in enumerate(_dynamics_outs)]
     state_difference_loss = tf.reduce_sum(_state_difference_losses, name='total_state_difference_loss')
 
     prediction_loss = tf.reduce_sum(_prediction_losses,
@@ -101,10 +121,11 @@ def build_dynamics_graph(scope,
         tf.summary.scalar('summary', prediction_loss)
         tf.summary.scalar('v_difference_loss', value_difference_loss)
         tf.summary.scalar('dvds', tf.reduce_mean(dvds_weight_full))
+        tf.summary.scalar('v_condition', v_condition)
         tf.summary.scalar('s_difference_loss', state_difference_loss)
 
     assert len(_prediction_losses) == len(_regularizer_losses)
-    # assert len(_value_difference_losses) == len(_regularizer_losses)
+    # Yunfei: original dynamic loss and our L^{(1)}.
     if not use_value:
         dynamics_losses = [
             _prediction_losses[i] + _regularizer_losses[i]
@@ -112,6 +133,7 @@ def build_dynamics_graph(scope,
         ]
         dynamics_loss = tf.add(prediction_loss, regularizer_loss,
                                name='total_dynamics_loss')
+    # Yunfei: L^{(0)}
     else:
         dynamics_losses = [
             _value_difference_losses[i] + _regularizer_losses[i]
@@ -134,7 +156,7 @@ def build_dynamics_graph(scope,
     #                             axis=0,
     #                             name='avg_prediction')
     logger.info("Built prediction network for scope %s" % (scope))
-    return dynamics_loss, prediction_loss, regularizer_loss, _dynamics_outs, dynamics_losses, value_difference_loss, state_difference_loss
+    return dynamics_loss, prediction_loss, regularizer_loss, _dynamics_outs, dynamics_losses, value_difference_loss, state_difference_loss, v_condition
 
 
 def build_policy_graph(policy_scope,
@@ -319,6 +341,7 @@ def train_models(env,
                                       shape=(None, n_models * n_dynamics_input),
                                       name='dyanmics_in_full')
     dvds_weight_full = tf.placeholder(tf.float32, shape=(None, n_models * n_states), name='dvds_weight_full')
+    dvds_raw_full = tf.placeholder(tf.float32, shape=(None, n_models * n_states), name='dvds_raw_full')
     y_training_full = tf.placeholder(tf.float32,
                                      shape=(None, n_models * n_states),
                                      name='y_training_full')
@@ -344,15 +367,18 @@ def train_models(env,
     dynamics_losses = {}
     value_difference_loss = {}
     state_difference_loss = {}
+    v_condition = {}
     for scope in model_scopes:
         dynamics_loss[scope], prediction_loss[scope], reg_loss[scope], \
-        dynamics_outs[scope], dynamics_losses[scope], value_difference_loss[scope], state_difference_loss[scope]= \
+        dynamics_outs[scope], dynamics_losses[scope], value_difference_loss[scope], state_difference_loss[scope], \
+        v_condition[scope] = \
             build_dynamics_graph(scope,
                                  dynamics_model,
                                  dynamics_in,
                                  dynamics_in_full,
                                  y_training_full,
                                  dvds_weight_full,
+                                 dvds_raw_full,
                                  value_f,
                                  dynamics_opt_params.use_value,
                                  n_dynamics_input,
@@ -586,7 +612,9 @@ def train_models(env,
     ## Performing ###
     #################
     if variant["perform"] == True:
-        model_dir = "./"
+        # Yunfei: Below is the code for visualizing. You will need to replace `model_dir` with the path of saved model.
+        # Yunfei: As far as I know, tensorflow hard-coded some paths in `checkpoint` file. Feel free to modify it to a relative path, it won't break the code. :)
+        model_dir = "./" # Replace it with path of saved model. It should be something like `./data/local/<env_name>/<env_name>_<time_stamp>_0001/training_logs/`
         saver.restore(sess, tf.train.latest_checkpoint(model_dir))
         print('load checkpoint from ', model_dir)
         rollout_params.render_every = 5
@@ -608,7 +636,7 @@ def train_models(env,
                          is_env_done,
                          kwargs['input_rms'],
                          kwargs['diff_rms'])
-        raise NotImplementedError
+        exit()
 
     ###############
     ## Learning ###
@@ -675,9 +703,11 @@ def train_models(env,
                                                  prediction_loss,  # for debugging
                                                  value_difference_loss,
                                                  state_difference_loss,
+                                                 v_condition,
                                                  dynamics_in_full,
                                                  y_training_full,
                                                  dvds_weight_full,
+                                                 dvds_raw_full,
                                                  value_f,
                                                  kwargs['rllab_algo'].baseline,  # value net
                                                  sess,
@@ -820,6 +850,7 @@ def train_models(env,
         count += 1
         if count > sweep_iters:
             if ask_to_run_more:
+                break
                 response = input('Do you want to run 5 more?\n')
                 if response in {'yes', 'y', 'Y', 'Yes'}:
                     sweep_iters += 5
@@ -970,9 +1001,11 @@ def optimize_models(dynamics_data,
                     prediction_loss,
                     value_difference_loss,
                     state_difference_loss,
+                    v_condition,
                     dynamics_in_full,
                     y_training_full,
                     dvds_weight_full,
+                    dvds_raw_full,
                     value_f_ph,
                     value_function,
                     sess,
@@ -1021,23 +1054,27 @@ def optimize_models(dynamics_data,
         x_batch_val = np.tile(dynamics_validation[scope].x, n_models)
         y_batch_val = np.tile(dynamics_validation[scope].y, n_models)
         # print('dynamics validation.y shape', dynamics_validation[scope].y.shape) # (1000,18)
+        # Yunfei: dvds_weighting refers to L^{(1)}
         if dvds_weighting:
+            # Yunfei: Analytically compute value gradient w.r.t. state.
+            # See line 49-59 in `rllab/baselines/linear_feature_baseline.py` for details.
+            _dvds_raw = value_function.gradient(dynamics_validation[scope].y)
+            dvds_raw_batch_val = np.tile(_dvds_raw, n_models)
             _dvds_gradient = (value_function.gradient(dynamics_validation[scope].y)) ** 2  # (batch_size, obs_size)
-            # TODO: regularize _dvds_gradient, prevent extremely huge value
+            # Yunfei: TODO: add option for gradient regularization. Now gradient is always normalized with batch average.
             _dvds_gradient = _dvds_gradient / np.sum(_dvds_gradient) * _dvds_gradient.shape[0] * _dvds_gradient.shape[1]
-            # dvds_batch_val = np.tile(_dvds_gradient, n_models) + np.tile(np.ones(dynamics_validation[scope].y.shape), n_models)
             dvds_batch_val = np.tile(_dvds_gradient, n_models)
+        # Yunfei: the original code
         else:
+            dvds_raw_batch_val = np.tile(np.ones(dynamics_validation[scope].y.shape), n_models)
             dvds_batch_val = np.tile(np.ones(dynamics_validation[scope].y.shape), n_models)
 
+        # Yunfei: In the first loop, value function is not fitted yet. I use random numbers to replace it.
         if value_function._coeffs is None:
-            coeff_batch_val = np.zeros((1, dynamics_validation[scope].y.shape[1]*2+4))
-            coeff_batch_val = np.random.rand(1, dynamics_validation[scope].y.shape[1]*2+4)
+            coeff_batch_val = np.random.rand(1, dynamics_validation[scope].y.shape[1] * 2 + 4)
             # print(coeff_batch_val.shape)
         else:
             coeff_batch_val = np.reshape(value_function._coeffs, (1, -1))
-
-        # TODO compute my intermediate result, need operator for V(f(s,\pi(s))), V(s_{t+1})
 
 
         logger.info('Model %s' % scope)
@@ -1070,19 +1107,19 @@ def optimize_models(dynamics_data,
             else:
                 assert dynamics_opt_params.sample_mode == 'random'
                 x_batch, y_batch = dynamics_data[scope].sample(batch_size * n_models)
+            # Yunfei: I'm doing the same modification for training data as what I have done for validation data
             if dvds_weighting:
-                # TODO: regularize _dvds_gradient, prevent extremely huge value
                 _dvds_gradient = (value_function.gradient(y_batch)) ** 2
+                # Yunfei: TODO: add option for gradient reg
                 _dvds_gradient = _dvds_gradient / np.sum(_dvds_gradient) * _dvds_gradient.shape[0] * \
                                  _dvds_gradient.shape[1]
-                # dvds_batch = _dvds_gradient + np.ones(y_batch.shape)
                 dvds_batch = _dvds_gradient
             else:
                 dvds_batch = np.ones(y_batch.shape)
 
             if value_function._coeffs is None:
-                coeff_batch = np.zeros((1, y_batch.shape[1]*2+4))
-                coeff_batch = np.random.randn(1, y_batch.shape[1]*2+4)
+                coeff_batch = np.zeros((1, y_batch.shape[1] * 2 + 4))
+                coeff_batch = np.random.randn(1, y_batch.shape[1] * 2 + 4)
                 # print(coeff_batch.shape)
             else:
                 coeff_batch = np.reshape(value_function._coeffs, (1, -1))
@@ -1165,13 +1202,18 @@ def optimize_models(dynamics_data,
         rllab_logger.record_tabular('# model updates', j)
         rllab_logger.record_tabular('%s_min_sum_validation_loss' % scope,
                                     min_sum_validation_loss)
-        _value_difference_loss, _state_difference_loss = sess.run([value_difference_loss[scope],
-                                          state_difference_loss[scope]],
-                                          {dynamics_in_full: x_batch_val[:5],
-                                           y_training_full: y_batch_val[:5],
-                                           value_f_ph: coeff_batch_val})
+        # Yunfei: for debugging purpose.
+        _value_difference_loss, _state_difference_loss, _v_condition = sess.run([value_difference_loss[scope],
+                                                                                 state_difference_loss[scope],
+                                                                                 v_condition[scope]],
+                                                                                {dynamics_in_full: x_batch_val[:5],
+                                                                                 y_training_full: y_batch_val[:5],
+                                                                                 value_f_ph: coeff_batch_val,
+                                                                                 dvds_weight_full: dvds_batch_val[:5],
+                                                                                 dvds_raw_full: dvds_raw_batch_val[:5]})
         rllab_logger.record_tabular('%s_value_diffrence_loss' % scope, _value_difference_loss)
         rllab_logger.record_tabular('%s_state_difference_loss' % scope, _state_difference_loss)
+        rllab_logger.record_tabular('%s_v_condition' % scope, _v_condition)
         # Save summary
         if TF_SUMMARY:
             summary = sess.run(
@@ -1179,6 +1221,7 @@ def optimize_models(dynamics_data,
                 feed_dict={dynamics_in_full: x_batch_val[:5],
                            y_training_full: y_batch_val[:5],
                            dvds_weight_full: dvds_batch_val[:5],
+                           dvds_raw_full: dvds_raw_batch_val[:5],
                            value_f_ph: coeff_batch_val,
                            }
             )

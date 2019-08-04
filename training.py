@@ -201,7 +201,7 @@ def train(variant):
                             variable_summaries(b)
                         with tf.name_scope('Wx_plus_b'):
                             pre_h = tf.matmul(h, w) + b
-                            # TODO: modify to dropout model
+                            # Yunfei: dropout option is useless now
                             if dropout:
                                 # if i == 0:
                                 #     pre_h = tf.nn.dropout(tf.matmul(h,w), keep_prob=0.8) + b
